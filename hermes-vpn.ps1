@@ -46,6 +46,26 @@ $InstallScriptUrls = @(
     'https://hermes-agent.nousresearch.com/install.ps1'
 )
 
+# ══════ 国内镜像清单（安装前会实际测速，挑最快的用）══════
+$RepoGitUrl    = 'https://github.com/NousResearch/hermes-agent.git'
+$RepoProbePath = 'https://github.com/NousResearch/hermes-agent/archive/refs/heads/main.tar.gz'
+$RepoMirrors = @(
+    @{ Name = 'gh-proxy';    Prefix = 'https://gh-proxy.com/' },
+    @{ Name = 'gh.llkk.cc';  Prefix = 'https://gh.llkk.cc/' },
+    @{ Name = 'ghproxy.net'; Prefix = 'https://ghproxy.net/' },
+    @{ Name = 'github直连';  Prefix = '' }
+)
+$PypiMirrors = @(
+    'https://pypi.tuna.tsinghua.edu.cn/simple',
+    'https://mirrors.aliyun.com/pypi/simple',
+    'https://pypi.mirrors.ustc.edu.cn/simple',
+    'https://mirrors.cloud.tencent.com/pypi/simple'
+)
+$NpmMirrors = @(
+    'https://registry.npmmirror.com',
+    'https://mirrors.cloud.tencent.com/npm'
+)
+
 # 找 Hermes-Setup.exe 的几个候选位置
 $SetupCands = @(
     (Join-Path $ScriptDir 'Hermes-Setup.exe'),
@@ -195,11 +215,65 @@ function Get-Setup {
 # 几十 KB/s"，于是它一直卡在慢线上、永远不切镜像（下个 git/uv 要几十分钟）。
 function Repair-InstallScript {
     param([string]$Text)
+    # ① 先把"测速排序"辅助函数插进安装脚本
+    if (-not $Text.Contains('HERMES_SPEED_ORDER')) {
+        $helper = @'
+# HERMES_SPEED_ORDER
+function Test-HermesUrlSpeed {
+    param([string]$Url, [int]$MaxBytes = 262144, [int]$TimeoutSec = 4)
+    if (-not $Url) { return 0 }
+    try {
+        $h = ([uri]$Url).Host
+        $dns = [System.Net.Dns]::BeginGetHostAddresses($h, $null, $null)
+        if (-not $dns.AsyncWaitHandle.WaitOne(2500)) { return 0 }
+        try { [void][System.Net.Dns]::EndGetHostAddresses($dns) } catch { return 0 }
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Timeout = $TimeoutSec * 1000
+        $req.ReadWriteTimeout = $TimeoutSec * 1000
+        try { $req.AddRange(0, $MaxBytes - 1) } catch {}
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $resp = $req.GetResponse(); $rs = $resp.GetResponseStream()
+        $buf = New-Object byte[] 65536; $total = 0
+        while ($total -lt $MaxBytes -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $n = $rs.Read($buf, 0, $buf.Length); if ($n -le 0) { break }; $total += $n
+        }
+        $sw.Stop(); try { $rs.Close() } catch {}; try { $resp.Close() } catch {}
+        if ($total -le 0) { return 0 }
+        return [int]($total / ([Math]::Max($sw.Elapsed.TotalSeconds, 0.05)) / 1024)
+    } catch { return 0 }
+}
+function Order-UrlsBySpeed {
+    param([string[]]$Urls)
+    $cands = @()
+    foreach ($u in $Urls) {
+        foreach ($c in @($u, "https://gh-proxy.com/$u", "https://gh.llkk.cc/$u")) {
+            if ($cands -notcontains $c) { $cands += $c }
+        }
+    }
+    $good = @(); $bad = @()
+    foreach ($c in $cands) {
+        $sp = Test-HermesUrlSpeed -Url $c
+        if ($sp -gt 0) { $good += [pscustomobject]@{ Url = $c; Speed = $sp } } else { $bad += $c }
+    }
+    $ordered = @($good | Sort-Object Speed -Descending | ForEach-Object { $_.Url })
+    if ($ordered.Count -eq 0) { return $Urls }
+    return @($ordered + $bad)
+}
+'@
+        $anchor = '$RepoUrl = if ($env:HERMES_REPO_URL)'
+        $idx = $Text.IndexOf($anchor)
+        if ($idx -ge 0) {
+            $eol = $Text.IndexOf("`n", $idx)
+            if ($eol -ge 0) { $Text = $Text.Insert($eol + 1, $helper + "`n") }
+        }
+    }
+
+    # ② 下载顺序：改成"先测速、挑最快的那个"（官方地址会自动加国内代理一起比）
     if ($Text.Contains('$urls = @($Url)')) {
-        # 顺序改成：镜像优先，官方兜底
         $Text = $Text.Replace('$urls = @($Url)', '$urls = @()')
-        $Text = $Text.Replace('if ($MirrorUrl -and $MirrorUrl -ne $Url) { $urls += $MirrorUrl }',
-                              'if ($MirrorUrl -and $MirrorUrl -ne $Url) { $urls += $MirrorUrl }; $urls += $Url')
+        $rep = 'if ($MirrorUrl -and $MirrorUrl -ne $Url) { $urls += $MirrorUrl }; $urls += $Url' + "`n" +
+               '    try { $urls = @(Order-UrlsBySpeed -Urls $urls) } catch {}'
+        $Text = $Text.Replace('if ($MirrorUrl -and $MirrorUrl -ne $Url) { $urls += $MirrorUrl }', $rep)
     }
     # 代码仓库默认地址也改成 gh-proxy 镜像（env 有设就以 env 为准）
     $Text = $Text.Replace('"https://github.com/NousResearch/hermes-agent.git"',
@@ -348,26 +422,118 @@ function Clear-Proxy {
 
 # ══════════════ 国内下载通道（安装 / 更新 共用）══════════════
 # 只设"给本次进程用"的环境变量 —— 关掉窗口就没了，天然零残留。
-function Set-MirrorEnv {
-    $env:HERMES_REPO_URL         = 'https://gh-proxy.com/https://github.com/NousResearch/hermes-agent.git'
-    $env:UV_DEFAULT_INDEX        = 'https://pypi.tuna.tsinghua.edu.cn/simple'
-    $env:UV_INDEX_URL            = 'https://pypi.tuna.tsinghua.edu.cn/simple'
-    $env:PIP_INDEX_URL           = 'https://pypi.tuna.tsinghua.edu.cn/simple'
-    $env:PIP_TRUSTED_HOST        = 'pypi.tuna.tsinghua.edu.cn'
-    $env:UV_PYTHON_INSTALL_MIRROR = 'https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download'
+# ══════ 测速：只下一小段，估算 KB/s（连不上=0）══════
+function Test-UrlSpeed {
+    param([string]$Url, [int]$MaxBytes = 262144, [int]$TimeoutSec = 4)
+    if (-not $Url) { return 0 }
+    try {
+        try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+        # 域名解析不了就立刻跳过（免得卡在被墙的域名上）
+        $h = ([uri]$Url).Host
+        $dns = [System.Net.Dns]::BeginGetHostAddresses($h, $null, $null)
+        if (-not $dns.AsyncWaitHandle.WaitOne(2500)) { return 0 }
+        try { [void][System.Net.Dns]::EndGetHostAddresses($dns) } catch { return 0 }
 
-    # ★ 编译桌面版（Electron）必需的 —— Electron 的二进制包有 100MB+，
-    #   默认从 GitHub 拉，不换镜像会一直卡在这一步。
-    $env:npm_config_registry              = 'https://registry.npmmirror.com'
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Timeout = $TimeoutSec * 1000
+        $req.ReadWriteTimeout = $TimeoutSec * 1000
+        $req.UserAgent = 'hermes-tool'
+        try { $req.AddRange(0, $MaxBytes - 1) } catch {}
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $resp = $req.GetResponse()
+        $rs = $resp.GetResponseStream()
+        $buf = New-Object byte[] 65536
+        $total = 0
+        while ($total -lt $MaxBytes -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $n = $rs.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+            $total += $n
+        }
+        $sw.Stop()
+        try { $rs.Close() } catch {}
+        try { $resp.Close() } catch {}
+        if ($total -le 0) { return 0 }
+        $sec = [Math]::Max($sw.Elapsed.TotalSeconds, 0.05)
+        return [int]($total / $sec / 1024)
+    } catch { return 0 }
+}
+
+# 从候选里挑最快的。每项：@{ Name=..; Url=..; Probe=.. }
+function Select-FastestMirror {
+    param([array]$Cands)
+    $best = $null
+    foreach ($c in $Cands) {
+        $sp = Test-UrlSpeed -Url $c.Probe
+        if ($sp -gt 0) {
+            Write-Host ("      {0,-16} {1,6} KB/s" -f $c.Name, $sp) -ForegroundColor DarkGray
+            if ($null -eq $best -or $sp -gt $best.Speed) {
+                $best = @{ Name = $c.Name; Url = $c.Url; Speed = $sp }
+            }
+        } else {
+            Write-Host ("      {0,-16}  连不上，跳过" -f $c.Name) -ForegroundColor DarkGray
+        }
+    }
+    return $best
+}
+
+# ══════ 配好国内下载通道（安装/更新共用；先测速、挑最快）══════
+function Set-MirrorEnv {
+    Say '  正在测速、挑选最快的国内镜像（约几秒）…' Gray
+
+    # ① 代码仓库
+    $repoCands = @()
+    foreach ($m in $RepoMirrors) {
+        $repoCands += @{ Name = $m.Name; Url = "$($m.Prefix)$RepoGitUrl"; Probe = "$($m.Prefix)$RepoProbePath" }
+    }
+    $repoBest = Select-FastestMirror -Cands $repoCands
+    if ($repoBest) {
+        $env:HERMES_REPO_URL = $repoBest.Url
+        MsgOK "代码仓库 → $($repoBest.Name)  ($($repoBest.Speed) KB/s)"
+    } else {
+        $env:HERMES_REPO_URL = "$($RepoMirrors[0].Prefix)$RepoGitUrl"
+        MsgTip '代码仓库：测速都没通，用默认镜像'
+    }
+
+    # ② Python 依赖（用各镜像 simple/pip/ 页面测速）
+    $pypiCands = @()
+    foreach ($m in $PypiMirrors) {
+        $pypiCands += @{ Name = ([uri]$m).Host; Url = $m; Probe = "$m/pip/" }
+    }
+    $pypiBest = Select-FastestMirror -Cands $pypiCands
+    if ($pypiBest) {
+        $env:UV_DEFAULT_INDEX = $pypiBest.Url
+        $env:UV_INDEX_URL     = $pypiBest.Url
+        $env:PIP_INDEX_URL    = $pypiBest.Url
+        $env:PIP_TRUSTED_HOST = ([uri]$pypiBest.Url).Host
+        MsgOK "Python 依赖 → $($pypiBest.Name)  ($($pypiBest.Speed) KB/s)"
+    } else {
+        $env:UV_DEFAULT_INDEX = $PypiMirrors[0]
+        $env:UV_INDEX_URL     = $PypiMirrors[0]
+        $env:PIP_INDEX_URL    = $PypiMirrors[0]
+        $env:PIP_TRUSTED_HOST = ([uri]$PypiMirrors[0]).Host
+        MsgTip 'Python 依赖：测速都没通，用默认镜像'
+    }
+
+    # ③ npm / Electron（用较大的 /react 包页面测速）
+    $npmCands = @()
+    foreach ($m in $NpmMirrors) {
+        $npmCands += @{ Name = ([uri]$m).Host; Url = $m; Probe = "$m/react" }
+    }
+    $npmBest = Select-FastestMirror -Cands $npmCands
+    if ($npmBest) {
+        $env:npm_config_registry = $npmBest.Url
+        MsgOK "npm 包 → $($npmBest.Name)  ($($npmBest.Speed) KB/s)"
+    } else {
+        $env:npm_config_registry = $NpmMirrors[0]
+    }
+
+    # ④ 其余固定镜像（无备选，直接用）
+    $env:UV_PYTHON_INSTALL_MIRROR         = 'https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download'
     $env:npm_config_disturl               = 'https://npmmirror.com/mirrors/node/'
     $env:ELECTRON_MIRROR                  = 'https://npmmirror.com/mirrors/electron/'
     $env:ELECTRON_BUILDER_BINARIES_MIRROR = 'https://npmmirror.com/mirrors/electron-builder-binaries/'
 
-    # ★ Hermes 有两个依赖必须从 GitHub 拿（kittentts / misaki），
-    #   上面那些镜像管不着。给 git 加一条 URL 重写规则，让所有
-    #   github.com 的 git 请求自动转到 gh-proxy 镜像。
-    #   用 GIT_CONFIG_* 环境变量而不是改 .gitconfig —— 只对本次有效，
-    #   关掉窗口就没了，不会污染你的系统。
+    # ★ Hermes 有几个依赖必须从 GitHub 拿，给 git 加 URL 重写（只对本次有效）
     $env:GIT_CONFIG_COUNT      = '1'
     $env:GIT_CONFIG_KEY_0      = 'url.https://gh-proxy.com/https://github.com/.insteadOf'
     $env:GIT_CONFIG_VALUE_0    = 'https://github.com/'
@@ -413,13 +579,12 @@ function Do-InstallMirror {
     }
     Say ''
 
-    Say '  已配好的下载通道：' Gray
-    MsgRaw '代码仓库（已预下好）→ gh-proxy.com 镜像（9.9 MB/s）'
-    MsgRaw 'Python 运行时 → gh-proxy.com 镜像'
-    MsgRaw 'Python 依赖   → 清华 PyPI 镜像'
-    MsgRaw '★ 编译桌面版用的 npm 包 → npmmirror 镜像'
-    MsgRaw '★ Electron 二进制（100MB+）→ npmmirror 镜像'
-    MsgRaw 'PortableGit / uv → Hermes 官方备用镜像（脚本自带）'
+    Say '  已配好的下载通道（都是上一步测速选出来的）：' Gray
+    if ($env:HERMES_REPO_URL)    { MsgRaw ("代码仓库    → " + $env:HERMES_REPO_URL) }
+    if ($env:PIP_INDEX_URL)      { MsgRaw ("Python 依赖 → " + $env:PIP_INDEX_URL) }
+    if ($env:npm_config_registry){ MsgRaw ("npm 包      → " + $env:npm_config_registry) }
+    MsgRaw '★ Electron / Node 二进制 → npmmirror 镜像'
+    MsgRaw '★ PortableGit / uv → 官方镜像 + 国内代理（自动挑最快）'
     Say ''
     MsgTip '这些只对本次安装有效，装完自动消失，不用清理。'
     Say ''
