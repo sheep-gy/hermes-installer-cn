@@ -285,23 +285,31 @@ function Order-UrlsBySpeed {
         if ($Text.Contains($anchor)) {
             $probe = @(
                 '',
-                '        # HERMES_MIRROR_PROBE: 依次探测可连通的仓库镜像（网络对域名挑食时用）',
-                '        $repoCands = @()',
-                '        if ($env:HERMES_REPO_URL) { $repoCands += $env:HERMES_REPO_URL }',
-                '        $repoCands += @(',
+                '        # HERMES_MIRROR_PROBE: 仓库镜像候选（挨个试，挂了自动换下一个）',
+                '        $repoTries = @()',
+                '        if ($env:HERMES_REPO_URL) { $repoTries += $env:HERMES_REPO_URL }',
+                '        $repoTries += @(',
                 "            'https://gh-proxy.com/https://github.com/NousResearch/hermes-agent.git',",
                 "            'https://gh.llkk.cc/https://github.com/NousResearch/hermes-agent.git',",
-                "            'https://gitcode.com/gh_mirrors/he/hermes-agent.git',",
                 "            'https://github.com/NousResearch/hermes-agent.git'",
                 '        )',
-                '        foreach ($rc in ($repoCands | Select-Object -Unique)) {',
-                '            git ls-remote --exit-code $rc HEAD 2>$null | Out-Null',
-                '            if (-not $LASTEXITCODE) { $script:RepoUrl = $rc; break }',
-                '        }'
+                '        $script:RepoTries = @($repoTries | Select-Object -Unique)',
+                '        if ($env:HERMES_REPO_URL) { $script:RepoUrl = $env:HERMES_REPO_URL }'
             ) -join "`n"
             $Text = $Text.Replace($anchor, $anchor + "`n" + $probe)
         }
     }
+
+    # 克隆时：低速就放弃；重试时换下一个镜像（镜像会说挂就挂）
+    $Text = $Text.Replace(
+        '                Invoke-Logged $cloneLabel { git clone @progress --filter=blob:none @checkout --branch $Branch $RepoUrl $tree }',
+        '                $tryUrl = $RepoUrl' + "`n" +
+        '                if ($script:RepoTries -and $script:RepoTries.Count -ge $attempt) { $tryUrl = $script:RepoTries[$attempt-1] }' + "`n" +
+        '                $cloneLabel = "Cloning $tryUrl ($Branch)"' + "`n" +
+        '                Invoke-Logged $cloneLabel { git -c http.lowSpeedLimit=2000 -c http.lowSpeedTime=25 clone @progress --filter=blob:none @checkout --branch $Branch $tryUrl $tree }')
+    $Text = $Text.Replace(
+        '                Invoke-Logged "Cloning history" { git clone @progress --filter=blob:none --no-checkout --branch $Branch $RepoUrl $tree }',
+        '                Invoke-Logged "Cloning history" { git -c http.lowSpeedLimit=2000 -c http.lowSpeedTime=25 clone @progress --filter=blob:none --no-checkout --branch $Branch $RepoUrl $tree }')
     return $Text
 }
 
@@ -537,6 +545,10 @@ function Set-MirrorEnv {
     $env:GIT_CONFIG_COUNT      = '1'
     $env:GIT_CONFIG_KEY_0      = 'url.https://gh-proxy.com/https://github.com/.insteadOf'
     $env:GIT_CONFIG_VALUE_0    = 'https://github.com/'
+
+    # 网络不稳时：让 git 在"低速"时尽快放弃，别卡在挂掉的镜像上（低于 2KB/s 持续 25 秒就断）
+    $env:GIT_HTTP_LOW_SPEED_LIMIT = '2000'
+    $env:GIT_HTTP_LOW_SPEED_TIME  = '25'
 }
 
 # ══════════════ 启动安装（走国内镜像，不用 VPN）══════════════
