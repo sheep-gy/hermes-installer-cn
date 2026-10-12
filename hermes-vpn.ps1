@@ -66,6 +66,24 @@ $NpmMirrors = @(
     'https://mirrors.cloud.tencent.com/npm'
 )
 
+# 本次安装的渠道：dev=开发版(main，默认) / stable=稳定版
+$InstallChannel = 'dev'
+
+# 查官方"稳定版"当前指向的发布标签（如 rc.15-v0.21.7）
+function Get-StableTag {
+    try {
+        try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {}
+        $c = Invoke-RestMethod -Uri 'https://hermes-assets.nousresearch.com/releases/channels/stable.json' -TimeoutSec 15
+        $bid = $c.head.buildId
+        if (-not $bid) { return '' }
+        $b = Invoke-RestMethod -Uri ("https://hermes-assets.nousresearch.com/releases/channel-builds/$bid/build.json") -TimeoutSec 20
+        foreach ($p in $b.packages) {
+            if ($p.artifact -and $p.artifact.key -match 'releases/tag/([^/]+)/') { return $Matches[1] }
+        }
+    } catch {}
+    return ''
+}
+
 # 找 Hermes-Setup.exe 的几个候选位置
 $SetupCands = @(
     (Join-Path $ScriptDir 'Hermes-Setup.exe'),
@@ -274,6 +292,16 @@ function Order-UrlsBySpeed {
         $rep = 'if ($MirrorUrl -and $MirrorUrl -ne $Url) { $urls += $MirrorUrl }; $urls += $Url' + "`n" +
                '    try { $urls = @(Order-UrlsBySpeed -Urls $urls) } catch {}'
         $Text = $Text.Replace('if ($MirrorUrl -and $MirrorUrl -ne $Url) { $urls += $MirrorUrl }', $rep)
+    }
+
+    # ③ 允许用环境变量钉住版本（用于"安装/更新到稳定版"）
+    if (-not $Text.Contains('HERMES_PIN_BRANCH')) {
+        $a3 = '$RepoUrl = if ($env:HERMES_REPO_URL)'
+        if ($Text.Contains($a3)) {
+            $Text = $Text.Replace($a3,
+                'if ($env:HERMES_PIN_BRANCH) { $Branch = $env:HERMES_PIN_BRANCH }' + "`n" +
+                'if ($env:HERMES_PIN_COMMIT) { $Commit = $env:HERMES_PIN_COMMIT }' + "`n" + $a3)
+        }
     }
     # 代码仓库默认地址也改成 gh-proxy 镜像（env 有设就以 env 为准）
     $Text = $Text.Replace('"https://github.com/NousResearch/hermes-agent.git"',
@@ -551,6 +579,22 @@ function Set-MirrorEnv {
     $env:GIT_HTTP_LOW_SPEED_TIME  = '25'
 }
 
+# ══════ 版本渠道选择（安装 / 更新 共用）══════
+function Select-Channel {
+    Say ''
+    Say '  你要哪个版本渠道？' White
+    MsgRaw '[1] 稳定版   —— 官方测试发布、最稳（日常推荐）'
+    MsgRaw '[2] 开发版   —— 最新代码、功能多，可能有 bug'
+    MsgRaw '[3] 预览版   —— 官方发布前的候选（canary）'
+    Say ''
+    $c = Read-Host '   输入 1 / 2 / 3 后回车（直接回车 = 开发版）'
+    switch ($c) {
+        '1' { return 'stable' }
+        '3' { return 'canary' }
+        default { return 'main' }
+    }
+}
+
 # ══════ 杀毒软件检测（它常在装 Python 依赖时拦截 uv 写文件，导致"拒绝访问"）══════
 function Get-ActiveAv {
     $map = @{
@@ -634,6 +678,25 @@ function Do-InstallMirror {
     MsgRaw '★ PortableGit / uv → 官方镜像 + 国内代理（自动挑最快）'
     Say ''
     MsgTip '这些只对本次安装有效，装完自动消失，不用清理。'
+    Say ''
+
+    # ── 版本渠道：稳定版 → 把版本钉到官方稳定标签；开发版 = main ──
+    $env:HERMES_PIN_BRANCH = ''
+    $env:HERMES_PIN_COMMIT = ''
+    if ($script:InstallChannel -eq 'stable') {
+        Say '  正在查官方稳定版号…' Gray
+        $tag = Get-StableTag
+        if ($tag) {
+            $env:HERMES_PIN_BRANCH = $tag
+            MsgOK "版本渠道：稳定版（$tag）"
+        } else {
+            MsgTip '没查到稳定版号，这次先按开发版装'
+        }
+    } elseif ($script:InstallChannel -eq 'canary') {
+        MsgTip '安装暂不支持"预览版" —— 先按开发版装，装好后可用【更新】切到预览版'
+    } else {
+        MsgOK '版本渠道：开发版（最新代码 main）'
+    }
     Say ''
 
     [void](Ensure-InstallScript)
@@ -967,6 +1030,10 @@ function Do-Update {
     MsgOK 'Hermes 已关闭，可以更新。'
     Say ''
 
+    # 选择更新到哪个渠道
+    $ch = Select-Channel
+    Say ''
+
     # ── ② 配好国内下载通道（只对本次有效，关窗即消失）──
     Set-MirrorEnv
 
@@ -993,7 +1060,7 @@ function Do-Update {
     $ok = $false
     $t0 = Get-Date
     try {
-        $p = Start-Process -FilePath $hermes -ArgumentList 'update','-y' `
+        $p = Start-Process -FilePath $hermes -ArgumentList 'update','-y','--channel',$ch `
              -RedirectStandardOutput $logFile -RedirectStandardError $errFile `
              -NoNewWindow -PassThru
         while (-not $p.HasExited) {
@@ -1040,11 +1107,11 @@ function Show-Menu {
         Write-Host ''
         Write-Host '   ========================================================' -ForegroundColor DarkCyan
         Write-Host ''
-        Write-Host '     [1]   启动 Hermes 安装   ★ 走国内镜像（最快，不用VPN）' -ForegroundColor Green
-        Write-Host '     [2]   启动 Hermes 安装     走 VPN 代理（原方式）' -ForegroundColor Gray
+        Write-Host '     [1]   安装 Hermes   ★ 走国内镜像（可先选 稳定版/开发版）' -ForegroundColor Green
+        Write-Host '     [2]   安装 Hermes     走 VPN 代理（原方式）' -ForegroundColor Gray
         Write-Host '     [3]   一键恢复原样（清掉所有代理残留）' -ForegroundColor Gray
         Write-Host '     [4]   查看当前状态' -ForegroundColor Gray
-        Write-Host '     [5]   检查并更新 Hermes   ★ 收到更新提示时用它（不用桌面端）' -ForegroundColor Green
+        Write-Host '     [5]   检查并更新 Hermes   ★ 可选渠道（稳定版/开发版/预览版）' -ForegroundColor Green
         Write-Host '     [0]   退出' -ForegroundColor Gray
         Write-Host ''
         Write-Host '   --------------------------------------------------------' -ForegroundColor DarkGray
@@ -1057,7 +1124,7 @@ function Show-Menu {
         $ch = Read-Host '   请输入数字后回车'
 
         switch ($ch) {
-            '1' { Clear-Host; Do-InstallMirror; Wait-Key }
+            '1' { Clear-Host; $script:InstallChannel = Select-Channel; Do-InstallMirror; Wait-Key }
             '2' { Clear-Host; Do-Install;       Wait-Key }
             '3' { Clear-Host; Do-Restore;       Wait-Key }
             '4' { Clear-Host; Show-Check;       Wait-Key }
