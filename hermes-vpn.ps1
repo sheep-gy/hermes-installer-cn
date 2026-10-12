@@ -551,11 +551,46 @@ function Set-MirrorEnv {
     $env:GIT_HTTP_LOW_SPEED_TIME  = '25'
 }
 
+# ══════ 杀毒软件检测（它常在装 Python 依赖时拦截 uv 写文件，导致"拒绝访问"）══════
+function Get-ActiveAv {
+    $map = @{
+        'QQPCRTP'       = '腾讯电脑管家'; 'QQPCTray' = '腾讯电脑管家'; 'QQPCMgr' = '腾讯电脑管家'; 'QMDL' = '腾讯电脑管家'
+        '360tray'       = '360安全卫士';  '360Safe'  = '360安全卫士';  'ZhuDongFangYu' = '360安全卫士'
+        '360sd'         = '360杀毒'
+        'HipsTray'      = '火绒安全';     'HipsDaemon' = '火绒安全';   'usysdiag' = '火绒安全'
+        'kxetray'       = '金山毒霸';     'kislive' = '金山毒霸'
+        'BaiduSdTray'   = '百度杀毒'
+        'MsMpEng'       = 'Windows Defender'
+    }
+    $hits = @()
+    foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
+        if ($map.ContainsKey($p.ProcessName)) { $hits += $map[$p.ProcessName] }
+    }
+    return @($hits | Sort-Object -Unique)
+}
+
+function Show-AvWarning {
+    $av = Get-ActiveAv
+    if (-not $av -or $av.Count -eq 0) { return }
+    Say ''
+    MsgTip ("检测到杀毒软件：{0}" -f ($av -join '、'))
+    MsgRaw '  它有可能在安装【最后一步·装 Python 依赖】时拦截 uv 写文件，'
+    MsgRaw '  报错是"拒绝访问 / Failed to update Windows PE resources"→ 整包装不下来。'
+    MsgRaw '  建议先做下面任一项，再装（能省一次十几分钟的等待）：'
+    MsgRaw '    · 把这两个文件夹加进它的【信任区 / 白名单】：'
+    MsgRaw ("        " + $env:LOCALAPPDATA + "\hermes")
+    MsgRaw ("        " + $env:LOCALAPPDATA + "\Temp")
+    MsgRaw '    · 或者【临时退出】杀毒软件，装完再打开'
+    Say ''
+}
+
 # ══════════════ 启动安装（走国内镜像，不用 VPN）══════════════
 function Do-InstallMirror {
     Say ''
     Say '  ────── 启动 Hermes 安装（走国内镜像）──────' Cyan
     Say ''
+
+    [void](Show-AvWarning)
 
     $setup = Get-Setup
     if (-not $setup) { Say ''; return }
@@ -614,6 +649,8 @@ function Do-Install {
     Say ''
     Say '  ────────── 启动 Hermes 安装 ──────────' Cyan
     Say ''
+
+    [void](Show-AvWarning)
 
     $setup = Get-Setup
     if (-not $setup) { Say ''; return }
@@ -780,6 +817,10 @@ function Show-Check {
 
     $setup = Find-Setup
     if ($setup) { MsgOK "安装程序：$setup" } else { MsgTip '安装程序：没找到 Hermes-Setup.exe' }
+
+    $av = Get-ActiveAv
+    if ($av.Count -gt 0) { MsgTip ("杀毒软件：" + ($av -join '、') + "（装 Python 依赖时可能拦截 uv，记得先加信任/白名单）") }
+    else { MsgRaw '杀毒软件：没检测到会拦的' }
 
     $tun = Get-TunnelAdapter
     if ($tun.Count -gt 0) { MsgOK "虚拟网卡：$($tun[0].Name) 已启用（TUN 全局模式）" }
